@@ -11,6 +11,10 @@ Pipeline:
   2. extract mono 16kHz audio from all pending videos in parallel with ffmpeg
   3. transcribe sequentially on the GPU, writing <name>-transcript.txt and .json
   4. sanity-check that each transcript covers the full audio duration
+  5. with --delete-videos, delete the source .mov/.mp4 files whose transcripts
+     passed that check (irreversible — the transcript is all that remains)
+
+Usage: python transcribe_all.py [--force] [--delete-videos]
 """
 
 import json
@@ -20,7 +24,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import numpy as np
 from mlx_whisper import transcribe as mlx_transcribe
+from mlx_whisper.audio import load_audio
+from faster_whisper.vad import (
+    get_speech_timestamps,
+    SpeechTimestampsMap,
+    VadOptions,
+)
 
 VIDEOS_DIR = Path(__file__).resolve().parent / "videos"
 MODEL = "mlx-community/whisper-large-v3-turbo"  # ~10x real-time on M-series GPU
@@ -78,35 +89,69 @@ def extract_audio(video_path: Path, audio_path: Path) -> bool:
 
 
 def transcribe(audio_path: Path, duration: float) -> dict:
-    """Transcribe one audio file into segments. End times are clipped to the
-    real audio duration (whisper often hallucinates a few seconds past the
-    end), and empty segments are dropped."""
+    """Transcribe one audio file into segments.
+
+    Silero VAD first finds the speech regions; MLX Whisper then transcribes
+    only those regions, and segment timestamps are mapped back onto the real
+    timeline. This stops whisper from looping hallucinations during long
+    stretches of silence (e.g. "Thank you." for minutes, "Bye." forever).
+
+    Empty segments are dropped, exact duplicates are collapsed, and times are
+    clipped to the real audio duration. Returns the final speech region end
+    alongside the segments.
+    """
+    audio = load_audio(str(audio_path))
+    speech_regions = get_speech_timestamps(audio, VadOptions(), sampling_rate=16000)
+
+    if speech_regions:
+        speech_audio = np.concatenate(
+            [audio[int(r["start"]) : int(r["end"])] for r in speech_regions]
+        )
+        map_to_original = SpeechTimestampsMap(speech_regions, 16000)
+    else:
+        speech_audio = audio
+        map_to_original = None
+
     result = mlx_transcribe(
-        str(audio_path),
+        speech_audio,
         path_or_hf_repo=MODEL,
         language=LANGUAGE,
         word_timestamps=WORD_TIMESTAMPS,
     )
+
     segments = []
     for seg in result["segments"]:
         text = seg["text"].strip()
         if not text:
             continue
-        start, end = seg["start"], seg["end"]
+        if map_to_original is not None:
+            # location of this region within the concatenated-speech timeline
+            # -> original wall-clock time of the recording
+            start = map_to_original.get_original_time(seg["start"])
+            end = map_to_original.get_original_time(seg["end"])
+        else:
+            start, end = seg["start"], seg["end"]
         if duration > 0:
             start = max(0.0, start)
             end = min(end, duration)
             if start >= end:
                 start = max(0.0, min(start, duration - 0.01))
                 end = duration
-        segments.append(
-            {
-                "start": round(start, 2),
-                "end": round(end, 2),
-                "text": text,
-            }
-        )
-    return {"segments": segments}
+        start, end = round(start, 2), round(end, 2)
+        if segments and segments[-1] == {"start": start, "end": end, "text": text}:
+            continue  # exact duplicate from a hallucination loop
+        segments.append({"start": start, "end": end, "text": text})
+    # speech_regions values are sample indexes on the ORIGINAL timeline
+    last_speech_end = (
+        round(speech_regions[-1]["end"] / 16000, 2) if speech_regions else None
+    )
+    return {"segments": segments, "speech_end": last_speech_end}
+
+
+def delete_video(video_file: Path, name: str):
+    """Delete the source video after its transcript has been verified."""
+    video_file.unlink()
+    print(f"[{name}] source video deleted ({video_file.name})")
 
 
 def is_done(video_dir: Path) -> bool:
@@ -132,25 +177,24 @@ def write_outputs(segments: list, txt_path: Path, json_path: Path):
             f.write(f"[{seg['start']:.2f} - {seg['end']:.2f}] {seg['text']}\n")
 
 
-def coverage_warning(segments: list, duration: float) -> str | None:
-    """Alert if the transcript doesn't span the audio (guards against truncated
-    or VAD-dropped output, e.g. a transcript that only starts at 190s)."""
+def coverage_warning(
+    segments: list, duration: float, speech_end: float | None
+) -> str | None:
+    """Alert if the transcript stops before the detected speech does (guards
+    against truncated output). Leading silence is fine — VAD skips it on
+    purpose — so only the timing and tail are checked."""
     if not segments:
         return "no speech was detected at all"
-    if duration <= 0:
+    reference = speech_end if speech_end and speech_end > 0 else duration
+    if reference <= 0:
         return None
-    first, last = segments[0]["start"], segments[-1]["end"]
-    problems = []
-    if first > max(60.0, duration * 0.10):
-        problems.append(
-            f"first speech starts at {first:.0f}s but audio is {duration:.0f}s"
-        )
-    if last < duration * 0.90:
-        problems.append(f"last speech ends at {last:.0f}s but audio is {duration:.0f}s")
-    return "; ".join(problems) if problems else None
+    last = segments[-1]["end"]
+    if last < reference * 0.95:
+        return f"last speech ends at {last:.0f}s but detected speech ends at {reference:.0f}s"
+    return None
 
 
-def main(force: bool = False):
+def main(force: bool = False, delete_videos: bool = False):
     if not VIDEOS_DIR.exists():
         print(f"Videos directory not found: {VIDEOS_DIR}")
         sys.exit(1)
@@ -201,7 +245,7 @@ def main(force: bool = False):
     # Stage 2: transcribe sequentially — the GPU is the bottleneck from here on.
     print("\nTranscribing...")
     done, failed = 0, 0
-    for video_dir, _ in jobs:
+    for video_dir, video_file in jobs:
         name = video_dir.name
         audio_path = video_dir / f"{name}.wav"
         if not audio_path.exists():
@@ -210,7 +254,8 @@ def main(force: bool = False):
         duration = durations.get(name, 0.0)
         try:
             t0 = time.time()
-            segments = transcribe(audio_path, duration)["segments"]
+            transcript = transcribe(audio_path, duration)
+            segments = transcript["segments"]
             elapsed = time.time() - t0
             write_outputs(
                 segments,
@@ -223,12 +268,15 @@ def main(force: bool = False):
                 f"[{name}] {len(segments)} segments written in {elapsed:.0f}s "
                 f"({rt:.1f}x real-time)"
             )
-            issue = coverage_warning(segments, duration)
+            issue = coverage_warning(segments, duration, transcript.get("speech_end"))
             if issue:
                 print(
-                    f"[{name}] WARNING: transcript may be incomplete: {issue}",
+                    f"[{name}] WARNING: transcript may be incomplete, keeping the "
+                    f"source video: {issue}",
                     file=sys.stderr,
                 )
+            elif delete_videos:
+                delete_video(video_file, name)
         except Exception as e:
             failed += 1
             print(f"[{name}] FAILED: {e}", file=sys.stderr)
@@ -239,4 +287,4 @@ def main(force: bool = False):
 
 
 if __name__ == "__main__":
-    main(force="--force" in sys.argv)
+    main(force="--force" in sys.argv, delete_videos="--delete-videos" in sys.argv)
